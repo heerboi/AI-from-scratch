@@ -1,8 +1,12 @@
 import torch
 import math
+import numpy as np
 
 import triton
 import triton.language as tl
+
+torch.manual_seed(0)
+torch.cuda.manual_seed_all(0)
 
 @triton.jit
 def fwd(Q, K, V, O, L,
@@ -12,8 +16,8 @@ def fwd(Q, K, V, O, L,
         K_stride_S, K_stride_D,
         V_stride_B, V_stride_H,
         V_stride_S, V_stride_D,
-        SCALE: tl.constexpr,
-        SEQ_LEN: tl.constexpr,
+        SEQ_LEN,
+        SCALE,
         NUM_HEADS: tl.constexpr,
         HEAD_DIM_Q: tl.constexpr,HEAD_DIM_KV: tl.constexpr,
         BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr):
@@ -76,12 +80,18 @@ def fwd(Q, K, V, O, L,
     Q_block = tl.load(Q_block_ptr)
 
     for kv_idx in range(0, SEQ_LEN, BLOCK_SIZE_KV):
+        kv_indices = kv_idx + kv_offsets
+
+        mask = q_offsets[:, None] >= kv_indices[None, :]
+
         K_block = tl.load(K_block_ptr)
-        QK_block = tl.dot(Q_block, K_block)
+        QK_block = tl.dot(Q_block, K_block) * SCALE
+        
+        QK_block = tl.where(mask, QK_block, -1e9)
 
         m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
 
-        QK_block = QK_block * SCALE - m_ij[:, None]
+        QK_block = QK_block - m_ij[:, None]
 
         P_block = tl.math.exp(QK_block)
 
@@ -92,7 +102,7 @@ def fwd(Q, K, V, O, L,
 
         V_block = tl.load(V_block_ptr)
 
-        P_block = P_block.to(tl.float16)
+        # P_block = P_block.to(tl.float16)
 
         O_block = O_block * correction[:, None]
         O_block = tl.dot(P_block, V_block, O_block)
@@ -115,7 +125,7 @@ def fwd(Q, K, V, O, L,
 class FlashAttn(torch.autograd.Function):
 
     @staticmethod
-    def forward( Q, K, V, causal=False, softmax_scale=None):
+    def forward(Q, K, V, causal=False, softmax_scale=None):
         if softmax_scale == None:
             softmax_scale = 1.0/math.sqrt(Q.shape[-1])
 
@@ -127,33 +137,58 @@ class FlashAttn(torch.autograd.Function):
 
         O = torch.zeros_like(Q, device="cuda")
         L = torch.zeros((B, N_H, SEQ_LEN), device="cuda")
+        
+        kernel_warmup = fwd.warmup(Q, K, V, O, L, Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+                  K.stride(0), K.stride(1), K.stride(2), K.stride(3),
+                  V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+                  SEQ_LEN=SEQ_LEN,
+                  SCALE = softmax_scale,
+                  NUM_HEADS = N_H, HEAD_DIM_Q=HEAD_DIM_Q, HEAD_DIM_KV=HEAD_DIM_K,
+                  BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32, grid=(1,))
 
-        grid = lambda args: (
-            SEQ_LEN // args["BLOCK_SIZE_Q"],
+        grid = (
+            SEQ_LEN // 32,
             N_H * B,
             1,
         )
 
         fwd[grid](Q, K, V, O, L, Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
                   K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-                  V.stride(0), V.stride(1), V.stride(2), V.stride(3),
+                  V.stride(0), V.stride(1), V.stride(2), V.stride(3), SEQ_LEN=SEQ_LEN,
                   SCALE = softmax_scale,
-                  NUM_HEADS = N_H,
-                  SEQ_LEN=SEQ_LEN, HEAD_DIM_Q=HEAD_DIM_Q, HEAD_DIM_KV=HEAD_DIM_K,
+                  NUM_HEADS = N_H, HEAD_DIM_Q=HEAD_DIM_Q, HEAD_DIM_KV=HEAD_DIM_K,
                   BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32)
-        # print("here")
-        print(O)
-        # print(L)
         
+        return O
 
-Q = torch.randn(1, 1, 512, 32, dtype=torch.float16, device="cuda")
-K = torch.randn(1, 1, 512, 32, dtype=torch.float16, device="cuda")
-V = torch.randn(1, 1, 512, 32, dtype=torch.float16, device="cuda")
+Q = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
+K = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
+V = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
 
 scale = 1.0/math.sqrt(32)
+mask = torch.tril(torch.ones(512, 512)).to(device="cuda")
 P = torch.matmul(Q, K.transpose(2,3)) * scale
-P = torch.softmax(P.float(), dim=-1).half()
+P.masked_fill_(torch.logical_not(mask), float("-inf"))
+print(P)
+P = torch.softmax(P.float(), dim=-1)
 
-O = torch.matmul(P, V)
+ref_O = torch.matmul(P, V)
+start = torch.cuda.Event(enable_timing=True)
+end = torch.cuda.Event(enable_timing=True)
+times = []
+
+for _ in range(100):
+    start.record()
+    O = FlashAttn.forward(Q, K, V)
+    end.record()
+    torch.cuda.synchronize()
+    times.append(start.elapsed_time(end)) 
+
+median_ms = np.median(times)
+
+print(times)
+print(median_ms)
+print(ref_O)
 print(O)
-FlashAttn.forward(Q, K, V)
+
+

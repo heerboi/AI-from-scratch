@@ -121,11 +121,118 @@ def fwd(Q, K, V, O, L,
     tl.store(O_block_ptr, O_block.to(O.type.element_ty))
     tl.store(L_ptrs, m_i)
 
+@triton.jit
+def _attn_bwd_computeD(O, dO, D, SEQ_LEN: tl.constexpr, BLOCK_SIZE: tl.constexpr, HEAD_DIM: tl.constexpr):
+    
+    block_idx = tl.program_id(0)
+
+    offs = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    head_batch_idx = tl.program_id(1)
+
+
+    head_idx = tl.arange(0, HEAD_DIM)
+
+    O_block = tl.load(
+        O 
+        + head_batch_idx * HEAD_DIM * SEQ_LEN
+        + offs[:, None] * HEAD_DIM
+        + head_idx[None, :]
+    ).to(tl.float32)
+
+    dO_block = tl.load(
+        dO 
+        + head_batch_idx * HEAD_DIM * SEQ_LEN
+        + offs[:, None] * HEAD_DIM
+        + head_idx[None, :]
+    ).to(tl.float32)
+
+    # reduce cols of the pointwise multiply
+    D_block = tl.sum(dO_block * O_block, axis = 1)
+
+    D_block_ptrs = D + head_batch_idx * SEQ_LEN + offs
+
+    tl.store(D_block_ptrs, D_block)
+
+@triton.jit
+def _attn_bwd_dk_dv(Q, K, V, softmax_scale, dO, dK, dV, D, L, stride_batch, stride_head, stride_seq, stride_dim,
+                    NUM_HEADS, SEQ_LEN, BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr, HEAD_DIM: tl.constexpr, STAGE: tl.constexpr):
+    
+    head_batch_idx = tl.program_id(2)
+    batch_idx = head_batch_idx // NUM_HEADS
+    head_idx = head_batch_idx % NUM_HEADS
+
+    # to skip to the relevant (1, 1, SEQ_LEN, HEAD_DIM)
+    # for tensors with head_dim
+    offset_head_batch = (stride_batch * batch_idx + stride_head * head_idx).to(tl.int64)
+
+    # this is for tensors with (B, N_H, SEQ_LEN) dim
+    # since the stride is of the 4 dim tensors, we directly use the head_batch_idx and SEQ_LEN
+    offset_head_batch_seq = (head_batch_idx * SEQ_LEN).to(tl.int64)
+
+
+    Q += offset_head_batch
+    K += offset_head_batch
+    V += offset_head_batch
+    dO += offset_head_batch
+    dK += offset_head_batch
+    dV += offset_head_batch
+
+    L += offset_head_batch_seq
+    D += offset_head_batch_seq
+
+    head_dim_offsets = tl.arange(0, HEAD_DIM)
+
+    # KV uses macro, and grid uses macro
+    block_idx_kv = tl.program_id(0)
+    start_idx_kv = block_idx_kv * BLOCK_KV
+
+    # relevant 128 offsets
+    kv_offsets = start_idx_kv + tl.arange(0, BLOCK_KV)
+
+    dV_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+    dK_block = tl.zeros([BLOCK_KV, HEAD_DIM], dtype=tl.float32)
+
+    # (MACRO, HEAD_DIM)
+    K_block = tl.load(
+        K + kv_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    )
+
+    V_block = tl.load(
+        V + kv_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    )
+
+    q_offsets = tl.arange(0, BLOCK_Q)
+
+    # q_ptrs = Q + q_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    # qT_ptrs = tl.trans(q_ptrs)
+    # better way of doing this is just by swapping the dimensions of the offsets
+
+    # (HEAD_DIM, MICRO)
+    qT_ptrs = Q + q_offsets[None, :] * stride_seq + head_dim_offsets[:, None] * stride_dim
+
+    dO_ptrs = dO + q_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+
+    q_ctr = 0
+    num_steps = SEQ_LEN // BLOCK_Q
+    for step in range(num_steps):
+        qT_block = tl.load(qT_ptrs)
+
+        q_offsets = q_ctr + tl.arange(0, BLOCK_Q)
+
+        # (MICRO, )
+        l = tl.load(l + q_offsets)
+
+        # (MACRO, MICRO)
+        QK_T_block = softmax_scale * tl.dot(K_block, qT_block) 
+
+        # apply the logsumexp across the columns since QK^T is transposed
+        # bit confusing fkjdsl
+        P_T_block = tl.math.exp(QK_T_block - l[None, :])
 
 class FlashAttn(torch.autograd.Function):
 
     @staticmethod
-    def forward(Q, K, V, causal=False, softmax_scale=None):
+    def forward(ctx, Q, K, V, causal=False, softmax_scale=None):
         if softmax_scale == None:
             softmax_scale = 1.0/math.sqrt(Q.shape[-1])
 
@@ -159,7 +266,55 @@ class FlashAttn(torch.autograd.Function):
                   NUM_HEADS = N_H, HEAD_DIM_Q=HEAD_DIM_Q, HEAD_DIM_KV=HEAD_DIM_K,
                   BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32)
         
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.grid = grid
+        ctx.softmax_scale = softmax_scale
+        ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
         return O
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O, L = ctx.saved_tensors
+
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+
+        B, N_H, SEQ_LEN = Q.shape[:-1]
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+
+        dQ = torch.empty_like(Q, device="cuda")
+        dK = torch.empty_like(K, device="cuda")
+        dV = torch.empty_like(V, device="cuda")
+
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO,
+                N_H * B)
+        D = torch.empty_like(L, device="cuda")
+
+        _attn_bwd_computeD[preprocess_grid](
+            O,
+            dO,
+            D,
+            SEQ_LEN,
+            BLOCK_SIZE_MACRO,
+            ctx.HEAD_DIM,
+        )
+
+        grid = (
+            SEQ_LEN // BLOCK_SIZE_MACRO,
+            1,
+            B * N_H
+        )
+
+        _attn_bwd_dk_dv[grid](
+            Q, K, V,
+            ctx.softmax_scale, dO, dK, dV, D, L,
+            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+            N_H, SEQ_LEN, BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO,
+            ctx.HEAD_DIM, NUM_WARPS, NUM_STAGES,
+        )
+
 
 Q = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
 K = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
@@ -188,7 +343,5 @@ median_ms = np.median(times)
 
 print(times)
 print(median_ms)
-print(ref_O)
-print(O)
 
 

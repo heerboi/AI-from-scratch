@@ -20,7 +20,7 @@ def fwd(Q, K, V, O, L,
         SCALE,
         NUM_HEADS: tl.constexpr,
         HEAD_DIM_Q: tl.constexpr,HEAD_DIM_KV: tl.constexpr,
-        BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr):
+        BLOCK_SIZE_Q: tl.constexpr, BLOCK_SIZE_KV: tl.constexpr, STAGE: tl.constexpr):
 
 
     block_idx = tl.program_id(0)
@@ -82,12 +82,13 @@ def fwd(Q, K, V, O, L,
     for kv_idx in range(0, SEQ_LEN, BLOCK_SIZE_KV):
         kv_indices = kv_idx + kv_offsets
 
-        mask = q_offsets[:, None] >= kv_indices[None, :]
 
         K_block = tl.load(K_block_ptr)
         QK_block = tl.dot(Q_block, K_block) * SCALE
         
-        QK_block = tl.where(mask, QK_block, -1e9)
+        if STAGE == 3:
+            mask = q_offsets[:, None] >= kv_indices[None, :]
+            QK_block = tl.where(mask, QK_block, -1e9)
 
         m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
 
@@ -102,7 +103,7 @@ def fwd(Q, K, V, O, L,
 
         V_block = tl.load(V_block_ptr)
 
-        # P_block = P_block.to(tl.float16)
+        P_block = P_block.to(tl.float16)
 
         O_block = O_block * correction[:, None]
         O_block = tl.dot(P_block, V_block, O_block)
@@ -152,6 +153,86 @@ def _attn_bwd_computeD(O, dO, D, SEQ_LEN: tl.constexpr, BLOCK_SIZE: tl.constexpr
     D_block_ptrs = D + head_batch_idx * SEQ_LEN + offs
 
     tl.store(D_block_ptrs, D_block)
+
+
+@triton.jit
+def _attn_bwd_dq(Q, K, V, softmax_scale, dO, dQ, D, L, stride_batch, stride_head, stride_seq, stride_dim,
+                    NUM_HEADS, SEQ_LEN, BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr, HEAD_DIM: tl.constexpr, STAGE: tl.constexpr):
+    
+    head_batch_idx = tl.program_id(2)
+    batch_idx = head_batch_idx // NUM_HEADS
+    head_idx = head_batch_idx % NUM_HEADS
+
+    # to skip to the relevant (1, 1, SEQ_LEN, HEAD_DIM)
+    # for tensors with head_dim
+    offset_head_batch = (stride_batch * batch_idx + stride_head * head_idx).to(tl.int64)
+
+    # this is for tensors with (B, N_H, SEQ_LEN) dim
+    # since the stride is of the 4 dim tensors, we directly use the head_batch_idx and SEQ_LEN
+    offset_head_batch_seq = (head_batch_idx * SEQ_LEN).to(tl.int64)
+
+
+    Q += offset_head_batch
+    K += offset_head_batch
+    V += offset_head_batch
+    dO += offset_head_batch
+    dQ += offset_head_batch
+
+    L += offset_head_batch_seq
+    D += offset_head_batch_seq
+    
+    head_dim_offsets = tl.arange(0, HEAD_DIM)
+
+    q_block_idx = tl.program_id(0)
+    q_block_start = q_block_idx * BLOCK_Q
+
+    q_offsets = q_block_start + tl.arange(0, BLOCK_Q)
+
+    dQ_block = tl.zeros([BLOCK_Q, HEAD_DIM], dtype = tl.float32)
+
+    Q_block = tl.load(
+        Q + q_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    )
+
+    kv_offsets = tl.arange(0, BLOCK_KV)
+    dO_block = tl.load(dO + q_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim)
+
+    L_block = tl.load(L + q_offsets)
+    L_block = L_block[:, None]
+
+    kT_ptrs = K + kv_offsets[None, :] * stride_seq + head_dim_offsets[:, None] * stride_dim
+    vT_ptrs = V + kv_offsets[None, :] * stride_seq + head_dim_offsets[:, None] * stride_dim
+
+    Di = tl.load(D + q_offsets)
+
+    kv_ctr = 0
+    num_steps = SEQ_LEN // BLOCK_KV
+
+    for step in range(num_steps):
+
+        K_T_block = tl.load(kT_ptrs)
+        V_T_block = tl.load(vT_ptrs)
+
+        QK_block = softmax_scale * tl.dot(Q_block, K_T_block)
+        P_block = tl.math.exp(QK_block - L_block)
+
+        if STAGE == 3:
+            kv_offsets = kv_ctr + tl.arange(0, BLOCK_KV)
+            mask_block = (q_offsets[:, None] >= kv_offsets[None, :])
+            P_block = tl.where(mask_block, P_block, 0.0)
+
+        dP_block = tl.dot(dO_block, V_T_block).to(tl.float32)
+        dS_block = P_block * (dP_block - Di[:, None])
+        dS_block = dS_block.to(tl.float16)
+
+        dQ_block += softmax_scale * tl.dot(dS_block, tl.trans(K_T_block))
+
+        kv_ctr += BLOCK_KV
+        kT_ptrs += BLOCK_KV * stride_seq
+        vT_ptrs += BLOCK_KV * stride_seq
+    
+    dQ_block_ptrs = dQ + q_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    tl.store(dQ_block_ptrs, dQ_block)
 
 @triton.jit
 def _attn_bwd_dk_dv(Q, K, V, softmax_scale, dO, dK, dV, D, L, stride_batch, stride_head, stride_seq, stride_dim,
@@ -216,11 +297,12 @@ def _attn_bwd_dk_dv(Q, K, V, softmax_scale, dO, dK, dV, D, L, stride_batch, stri
     num_steps = SEQ_LEN // BLOCK_Q
     for step in range(num_steps):
         qT_block = tl.load(qT_ptrs)
+        dO_block = tl.load(dO_ptrs)
 
         q_offsets = q_ctr + tl.arange(0, BLOCK_Q)
 
         # (MICRO, )
-        l = tl.load(l + q_offsets)
+        l = tl.load(L + q_offsets)
 
         # (MACRO, MICRO)
         QK_T_block = softmax_scale * tl.dot(K_block, qT_block) 
@@ -228,6 +310,34 @@ def _attn_bwd_dk_dv(Q, K, V, softmax_scale, dO, dK, dV, D, L, stride_batch, stri
         # apply the logsumexp across the columns since QK^T is transposed
         # bit confusing fkjdsl
         P_T_block = tl.math.exp(QK_T_block - l[None, :])
+
+        if STAGE == 3:
+
+            mask_block = (
+                q_offsets[None, :] >= kv_offsets[:, None]
+            )
+            P_T_block = tl.where(mask_block, P_T_block, 0.0)
+
+        dV_block += tl.dot(P_T_block.to(tl.float16), dO_block)
+
+        Di = tl.load(D + q_offsets)
+
+        dPt_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
+
+        dS_T_block = P_T_block * (dPt_block - Di[None, :])
+        dS_T_block = dS_T_block.to(tl.float16)
+
+        dK_block += softmax_scale * tl.dot(dS_T_block, tl.trans(qT_block))
+
+        q_ctr += BLOCK_Q
+        qT_ptrs += BLOCK_Q * stride_seq
+        dO_ptrs += BLOCK_Q * stride_seq
+
+    dV_block_ptrs = dV + kv_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    tl.store(dV_block_ptrs, dV_block)
+
+    dK_block_ptrs = dK + kv_offsets[:, None] * stride_seq + head_dim_offsets[None, :] * stride_dim
+    tl.store(dK_block_ptrs, dK_block)
 
 class FlashAttn(torch.autograd.Function):
 
@@ -244,6 +354,7 @@ class FlashAttn(torch.autograd.Function):
 
         O = torch.zeros_like(Q, device="cuda")
         L = torch.zeros((B, N_H, SEQ_LEN), device="cuda")
+        STAGE = 3 if causal else 1
         
         kernel_warmup = fwd.warmup(Q, K, V, O, L, Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
                   K.stride(0), K.stride(1), K.stride(2), K.stride(3),
@@ -251,7 +362,7 @@ class FlashAttn(torch.autograd.Function):
                   SEQ_LEN=SEQ_LEN,
                   SCALE = softmax_scale,
                   NUM_HEADS = N_H, HEAD_DIM_Q=HEAD_DIM_Q, HEAD_DIM_KV=HEAD_DIM_K,
-                  BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32, grid=(1,))
+                  BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32, grid=(1,), STAGE=STAGE)
 
         grid = (
             SEQ_LEN // 32,
@@ -264,7 +375,7 @@ class FlashAttn(torch.autograd.Function):
                   V.stride(0), V.stride(1), V.stride(2), V.stride(3), SEQ_LEN=SEQ_LEN,
                   SCALE = softmax_scale,
                   NUM_HEADS = N_H, HEAD_DIM_Q=HEAD_DIM_Q, HEAD_DIM_KV=HEAD_DIM_K,
-                  BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32)
+                  BLOCK_SIZE_Q=32,BLOCK_SIZE_KV=32, STAGE=STAGE)
         
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.grid = grid
@@ -306,42 +417,82 @@ class FlashAttn(torch.autograd.Function):
             1,
             B * N_H
         )
+        stage = 3 if ctx.causal else 1
 
         _attn_bwd_dk_dv[grid](
             Q, K, V,
             ctx.softmax_scale, dO, dK, dV, D, L,
             Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
             N_H, SEQ_LEN, BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO,
-            ctx.HEAD_DIM, NUM_WARPS, NUM_STAGES,
+            ctx.HEAD_DIM, STAGE=stage, num_stages=NUM_STAGES, num_warps=NUM_WARPS,
         )
 
+        _attn_bwd_dq[grid](
+            Q, K, V,
+            ctx.softmax_scale, dO, dQ, D, L,
+            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
+            N_H, SEQ_LEN, BLOCK_SIZE_MACRO, BLOCK_SIZE_MICRO,
+            ctx.HEAD_DIM, STAGE=stage, num_stages=NUM_STAGES, num_warps=NUM_WARPS,
+        )
 
-Q = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
-K = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
-V = torch.randn(1, 1, 512, 32, dtype=torch.float32, device="cuda")
-
-scale = 1.0/math.sqrt(32)
-mask = torch.tril(torch.ones(512, 512)).to(device="cuda")
-P = torch.matmul(Q, K.transpose(2,3)) * scale
-P.masked_fill_(torch.logical_not(mask), float("-inf"))
-print(P)
-P = torch.softmax(P.float(), dim=-1)
-
-ref_O = torch.matmul(P, V)
-start = torch.cuda.Event(enable_timing=True)
-end = torch.cuda.Event(enable_timing=True)
-times = []
-
-for _ in range(100):
-    start.record()
-    O = FlashAttn.forward(Q, K, V)
-    end.record()
-    torch.cuda.synchronize()
-    times.append(start.elapsed_time(end)) 
-
-median_ms = np.median(times)
-
-print(times)
-print(median_ms)
+        return dQ, dK, dV, None, None
 
 
+def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
+    Q = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    K = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+    V = (
+        torch.empty(
+            (BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM), dtype=dtype, device="cuda"
+        )
+        .normal_(mean=0.0, std=0.5)
+        .requires_grad_()
+    )
+
+    softmax_scale = 1 / (HEAD_DIM**0.5)
+    dO = torch.randn_like(Q)
+
+    # reference implementation
+    MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device="cuda"))
+    P = torch.matmul(Q, K.transpose(2, 3)) * softmax_scale
+    if causal:
+        P[:, :, MASK == 0] = float("-inf")
+    P = torch.softmax(P.float(), dim=-1).half()
+    ref_O = torch.matmul(P, V)
+    ref_O.backward(dO)
+    ref_dV, V.grad = V.grad.clone(), None
+    ref_dK, K.grad = K.grad.clone(), None
+    ref_dQ, Q.grad = Q.grad.clone(), None
+
+    # triton implementation
+    tri_out = FlashAttn.apply(Q, K, V, causal, softmax_scale).half()
+    tri_out.backward(dO)
+    tri_dV, V.grad = V.grad.clone(), None
+    tri_dK, K.grad = K.grad.clone(), None
+    tri_dQ, Q.grad = Q.grad.clone(), None
+
+    # compare
+    rtol = 0.0
+    atol = 1e-2
+    assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
+
+
+if __name__ == "__main__":
+    test_op(BATCH_SIZE=2, NUM_HEADS=2, SEQ_LEN=256, HEAD_DIM=32, causal=True)
+    test_op(BATCH_SIZE=2, NUM_HEADS=2, SEQ_LEN=256, HEAD_DIM=32, causal=False)
+    print("PASSED")
